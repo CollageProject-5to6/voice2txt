@@ -10,6 +10,15 @@ import sounddevice as sd
 import soundfile as sf
 import numpy as np
 import threading
+import queue
+import collections
+
+# Optional memory monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 
 # --- Platform Detection and Library Import ---
@@ -249,6 +258,172 @@ def create_vu_meter(audio_data: np.ndarray, width: int = 30) -> str:
     return meter
 
 
+class StreamingAudioCapture:
+    """Manages streaming audio capture with circular buffer for continuous transcription."""
+    
+    def __init__(self, chunk_size: int = 10, buffer_size: int = 30, samplerate: int = 16000):
+        self.chunk_size = chunk_size  # seconds
+        self.buffer_size = buffer_size  # seconds  
+        self.samplerate = samplerate
+        self.channels = 1
+        self.dtype = "float32"
+        self.blocksize = 1024
+        
+        # Circular buffer to store recent audio
+        buffer_frames = buffer_size * samplerate
+        self.audio_buffer = collections.deque(maxlen=buffer_frames)
+        
+        # Thread coordination
+        self.stop_event = threading.Event()
+        self.chunk_queue = queue.Queue()
+        self.audio_thread = None
+        self.transcription_thread = None
+        
+        # Visualization state
+        self.recent_frames = []
+        self.max_recent_frames = 50
+        
+        # Memory monitoring
+        self.memory_check_interval = 60  # seconds
+        self.last_memory_check = 0
+        
+    def start_capture(self, visualize: bool = True, viz_style: str = "vu"):
+        """Start the streaming audio capture."""
+        self.visualize = visualize
+        self.viz_style = viz_style
+        
+        # Start audio capture thread
+        self.audio_thread = threading.Thread(target=self._audio_capture_loop)
+        self.audio_thread.start()
+        
+        # Start chunk processing thread
+        self.transcription_thread = threading.Thread(target=self._chunk_processor_loop)
+        self.transcription_thread.start()
+        
+    def stop_capture(self):
+        """Stop the streaming audio capture."""
+        self.stop_event.set()
+        if self.audio_thread:
+            self.audio_thread.join()
+        if self.transcription_thread:
+            self.transcription_thread.join()
+            
+    def _audio_capture_loop(self):
+        """Main audio capture loop running in separate thread."""
+        try:
+            with sd.InputStream(
+                samplerate=self.samplerate, 
+                channels=self.channels, 
+                dtype=self.dtype, 
+                blocksize=self.blocksize
+            ) as stream:
+                while not self.stop_event.is_set():
+                    try:
+                        data, overflowed = stream.read(self.blocksize)
+                        
+                        # Add to circular buffer
+                        for sample in data.flatten():
+                            self.audio_buffer.append(sample)
+                            
+                        # Update visualization
+                        if self.visualize:
+                            self._update_visualization(data)
+                            
+                    except Exception as e:
+                        print(f"⚠️ Audio capture error: {e}")
+                        break
+                        
+        except Exception as e:
+            print(f"⚠️ Failed to start audio stream: {e}")
+            
+    def _update_visualization(self, data):
+        """Update real-time visualization."""
+        self.recent_frames.append(data)
+        if len(self.recent_frames) > self.max_recent_frames:
+            self.recent_frames.pop(0)
+            
+        if self.recent_frames:
+            recent_audio = np.concatenate(self.recent_frames, axis=0).flatten()
+            
+            if self.viz_style == "bars":
+                bar_lines = create_frequency_bars(recent_audio, num_bars=40, height=5)
+                sys.stdout.write(f"\033[5A")
+                for line in bar_lines:
+                    sys.stdout.write(f"\033[K{line}\n")
+                sys.stdout.flush()
+            elif self.viz_style == "spectrum":
+                spectrum = create_spectrum_display(recent_audio, width=60)
+                sys.stdout.write(f"\033[A\033[K{spectrum}\n")
+                sys.stdout.flush()
+            elif self.viz_style == "vu":
+                vu_meter = create_vu_meter(recent_audio, width=40)
+                sys.stdout.write(f"\033[A\033[K[{vu_meter}]\n")
+                sys.stdout.flush()
+            else:  # waveform
+                waveform = create_waveform_display(recent_audio, width=60)
+                sys.stdout.write(f"\033[A\033[K{waveform}\n")
+                sys.stdout.flush()
+                
+    def _chunk_processor_loop(self):
+        """Process audio chunks for transcription."""
+        chunk_frames = self.chunk_size * self.samplerate
+        last_chunk_time = time.time()
+        
+        while not self.stop_event.is_set():
+            current_time = time.time()
+            
+            # Process chunk every chunk_size seconds
+            if current_time - last_chunk_time >= self.chunk_size:
+                if len(self.audio_buffer) >= chunk_frames:
+                    # Extract chunk from buffer
+                    chunk_data = np.array(list(self.audio_buffer)[-chunk_frames:])
+                    
+                    # Put chunk in queue for transcription
+                    timestamp = datetime.datetime.now()
+                    self.chunk_queue.put((chunk_data, timestamp))
+                    
+                    last_chunk_time = current_time
+                    
+                # Memory monitoring
+                current_time = time.time()
+                if current_time - self.last_memory_check > self.memory_check_interval:
+                    self._check_memory_usage()
+                    self.last_memory_check = current_time
+                    
+            # Small sleep to prevent busy waiting
+            time.sleep(0.1)
+            
+    def get_chunk(self, timeout: float = 1.0):
+        """Get the next audio chunk for transcription."""
+        try:
+            return self.chunk_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None, None
+            
+    def _check_memory_usage(self):
+        """Monitor memory usage and log warnings if necessary."""
+        if not PSUTIL_AVAILABLE:
+            return
+            
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            
+            # Warn if memory usage exceeds 500MB
+            if memory_mb > 500:
+                print(f"⚠️  High memory usage: {memory_mb:.1f}MB")
+                
+            # Force garbage collection if over 200MB
+            if memory_mb > 200:
+                import gc
+                gc.collect()
+                
+        except Exception as e:
+            # Don't fail on memory monitoring errors
+            pass
+
+
 def record_audio(
     filename: str,
     immediate: bool = False,
@@ -432,6 +607,153 @@ def edit_transcription(text: str) -> str:
         os.remove(tmp_file_path)
 
 
+def stream_transcribe(
+    output_path: str,
+    model_name: str,
+    chunk_size: int = 10,
+    buffer_size: int = 30,
+    immediate: bool = False,
+    visualize: bool = True,
+    viz_style: str = "vu"
+):
+    """Main streaming transcription function."""
+    print(f"🎤 Starting streaming transcription with {WHISPER_BACKEND} ({model_name})")
+    print(f"📝 Output file: {output_path}")
+    print(f"⚙️  Chunk size: {chunk_size}s, Buffer size: {buffer_size}s")
+    print()
+    
+    if not immediate:
+        print("Press [Enter] to start streaming...")
+        input()
+    
+    # Initialize audio capture
+    capture = StreamingAudioCapture(
+        chunk_size=chunk_size,
+        buffer_size=buffer_size
+    )
+    
+    # Load Whisper model
+    print("🔄 Loading Whisper model...")
+    if WHISPER_BACKEND == "mlx":
+        # MLX doesn't need pre-loading
+        whisper_model = None
+    else:
+        whisper_model = whisper_lib.load_model(model_name)
+    
+    # Setup visualization
+    if visualize:
+        print("🔴 Streaming... Press [Enter] to stop.")
+        if viz_style == "bars":
+            for _ in range(5):
+                print()
+        else:
+            print()
+    else:
+        print("🔴 Streaming... Press [Enter] to stop.")
+    
+    # Start capture
+    capture.start_capture(visualize=visualize, viz_style=viz_style)
+    
+    # Setup output file
+    with open(output_path, "w", encoding="utf-8") as output_file:
+        output_file.write(f"# Streaming Transcription - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        output_file.flush()
+        
+        # Setup stop listener
+        stop_flag = threading.Event()
+        
+        def input_listener():
+            input()
+            stop_flag.set()
+            
+        input_thread = threading.Thread(target=input_listener)
+        input_thread.start()
+        
+        # Main transcription loop
+        chunk_count = 0
+        last_text = ""
+        
+        try:
+            while not stop_flag.is_set():
+                # Get next audio chunk
+                chunk_data, timestamp = capture.get_chunk(timeout=1.0)
+                
+                if chunk_data is not None:
+                    chunk_count += 1
+                    
+                    # Create temporary file for this chunk
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+                        sf.write(temp_audio.name, chunk_data, capture.samplerate)
+                        temp_audio_path = temp_audio.name
+                    
+                    try:
+                        # Transcribe chunk
+                        if WHISPER_BACKEND == "mlx":
+                            result = whisper_lib(temp_audio_path, path_or_hf_repo=model_name)
+                            text = result["text"].strip()
+                        else:
+                            result = whisper_model.transcribe(temp_audio_path)
+                            text = result["text"].strip()
+                        
+                        # Only write if we have new content
+                        if text and text != last_text:
+                            # Simple deduplication - avoid repeating the same text
+                            if not last_text or not text.startswith(last_text[:50]):
+                                datetime_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                                output_line = f"[{datetime_str}] {text}\n"
+                                output_file.write(output_line)
+                                output_file.flush()
+                                
+                                # Show progress (clear visualization and show text)
+                                if visualize:
+                                    if viz_style == "bars":
+                                        sys.stdout.write(f"\033[5A")
+                                        for _ in range(5):
+                                            sys.stdout.write(f"\033[K\n")
+                                        sys.stdout.write(f"\033[5A")
+                                    else:
+                                        sys.stdout.write(f"\033[A\033[K")
+                                    
+                                print(f"✅ [{datetime_str}] {text}")
+                                
+                                if visualize:
+                                    if viz_style == "bars":
+                                        for _ in range(5):
+                                            print()
+                                    else:
+                                        print()
+                                
+                                last_text = text
+                        
+                    except Exception as e:
+                        print(f"⚠️ Transcription error: {e}")
+                    finally:
+                        # Cleanup temp file
+                        try:
+                            os.remove(temp_audio_path)
+                        except:
+                            pass
+                            
+        except KeyboardInterrupt:
+            stop_flag.set()
+        finally:
+            # Cleanup
+            capture.stop_capture()
+            input_thread.join()
+            
+            # Clear visualization
+            if visualize:
+                if viz_style == "bars":
+                    for _ in range(5):
+                        sys.stdout.write("\033[A\033[K")
+                else:
+                    sys.stdout.write("\033[A\033[K")
+                sys.stdout.flush()
+                
+    print(f"✅ Streaming complete. Processed {chunk_count} chunks.")
+    print(f"📄 Transcription saved to: {output_path}")
+
+
 # --- Main Execution ---
 
 
@@ -470,6 +792,23 @@ def main():
         default="vu",
         help="Visualization style: vu (VU meter, default), waveform, bars (Winamp-style frequency), or spectrum (horizontal).",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Enable streaming mode for continuous transcription without storing full audio files.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=10,
+        help="Audio chunk size in seconds for streaming mode (default: 10).",
+    )
+    parser.add_argument(
+        "--buffer-size",
+        type=int,
+        default=30,
+        help="Audio buffer size in seconds for streaming mode (default: 30).",
+    )
     default_folder = get_default_output_folder()
     folder_help = (
         f" Defaults to WHISPER_OUTPUT_FOLDER env var ({default_folder}) if set."
@@ -487,48 +826,66 @@ def main():
 
     # Get the model name for the selected size
     model_name = get_model_name(args.model)
-
-    # 1. Record Audio
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_tmp:
-        audio_file_path = audio_tmp.name
-    record_audio(audio_file_path, args.immediate, not args.no_visualize, args.viz_style)
-
-    # 2. Transcribe Audio
-    print(
-        f"🎤 Transcribing audio using {WHISPER_BACKEND} with {args.model} model... (This may take a moment)"
-    )
-    try:
-        if WHISPER_BACKEND == "mlx":
-            # MLX Whisper API
-            result = whisper_lib(audio_file_path, path_or_hf_repo=model_name)
-            transcribed_text = result["text"]
-        else:
-            # OpenAI Whisper API
-            model = whisper_lib.load_model(model_name)
-            result = model.transcribe(audio_file_path)
-            transcribed_text = result["text"]
-    except Exception as e:
-        print(f"⚠️ Transcription failed: {e}")
-        transcribed_text = ""  # Ensure it's empty if transcription fails
-
-    os.remove(audio_file_path)  # Clean up temporary audio file
-
-    if not transcribed_text:
-        print("⚠️ Transcription produced no text. Exiting.")
-        exit(1)
-
-    # 3. Optional Edit Step
-    if args.edit:
-        final_text = edit_transcription(transcribed_text)
-    else:
-        final_text = transcribed_text
-
-    # 4. Determine Output Path and Save
+    
+    # Determine output path
     output_file_path = determine_output_path(args.output_path)
-    with open(output_file_path, "w", encoding="utf-8") as f:
-        f.write(final_text)
 
-    print(f"✅ Saved to: {output_file_path}")
+    if args.stream:
+        # Streaming mode
+        if args.edit:
+            print("⚠️ Edit mode not supported in streaming mode. Transcription will be saved directly.")
+        
+        stream_transcribe(
+            output_path=output_file_path,
+            model_name=model_name,
+            chunk_size=args.chunk_size,
+            buffer_size=args.buffer_size,
+            immediate=args.immediate,
+            visualize=not args.no_visualize,
+            viz_style=args.viz_style
+        )
+    else:
+        # Traditional mode (record full audio then transcribe)
+        # 1. Record Audio
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_tmp:
+            audio_file_path = audio_tmp.name
+        record_audio(audio_file_path, args.immediate, not args.no_visualize, args.viz_style)
+
+        # 2. Transcribe Audio
+        print(
+            f"🎤 Transcribing audio using {WHISPER_BACKEND} with {args.model} model... (This may take a moment)"
+        )
+        try:
+            if WHISPER_BACKEND == "mlx":
+                # MLX Whisper API
+                result = whisper_lib(audio_file_path, path_or_hf_repo=model_name)
+                transcribed_text = result["text"]
+            else:
+                # OpenAI Whisper API
+                model = whisper_lib.load_model(model_name)
+                result = model.transcribe(audio_file_path)
+                transcribed_text = result["text"]
+        except Exception as e:
+            print(f"⚠️ Transcription failed: {e}")
+            transcribed_text = ""  # Ensure it's empty if transcription fails
+
+        os.remove(audio_file_path)  # Clean up temporary audio file
+
+        if not transcribed_text:
+            print("⚠️ Transcription produced no text. Exiting.")
+            exit(1)
+
+        # 3. Optional Edit Step
+        if args.edit:
+            final_text = edit_transcription(transcribed_text)
+        else:
+            final_text = transcribed_text
+
+        # 4. Save
+        with open(output_file_path, "w", encoding="utf-8") as f:
+            f.write(final_text)
+
+        print(f"✅ Saved to: {output_file_path}")
 
 
 if __name__ == "__main__":

@@ -25,18 +25,33 @@ A cross-platform command-line utility for voice-to-text transcription. Uses MLX 
 - Set default folder: `export WHISPER_OUTPUT_FOLDER=~/notes` then `make run` (saves to ~/notes with timestamp)
 - Combine options: `make run ARGS="-i -e notes/"` (immediate start, edit before save, save to notes folder)
 
+### Streaming Mode (Long-Running Sessions)
+- Continuous transcription: `make run ARGS="--stream"` (memory-efficient, no disk storage)
+- Fast streaming with small model: `make run ARGS="--stream -m tiny.en"`
+- Custom chunk timing: `make run ARGS="--stream --chunk-size 5 --buffer-size 20"`
+- All-day streaming: `make run ARGS="--stream -i meeting-log.txt"` (immediate start, saves timestamped chunks)
+
 ## Architecture
 
-Single-file Python utility (`voice2txt.py`) with the following flow:
-1. **Audio Recording**: Uses `sounddevice` to capture audio from microphone (16kHz, mono)
-2. **Transcription**: Processes audio through Whisper model (MLX on macOS, OpenAI Whisper on other platforms)
+Single-file Python utility (`voice2txt.py`) with two modes:
+
+### Traditional Mode (Default)
+1. **Audio Recording**: Uses `sounddevice` to capture full audio to temporary file (16kHz, mono)
+2. **Transcription**: Processes complete audio through Whisper model (MLX on macOS, OpenAI Whisper on other platforms)
 3. **Optional Editing**: Opens transcription in `$EDITOR` if `-e` flag provided
 4. **File Output**: Saves to specified path or timestamped file
 
+### Streaming Mode (`--stream`)
+1. **Continuous Audio Capture**: Circular buffer maintains 30-second audio window
+2. **Chunked Processing**: Extracts 10-second chunks every 10 seconds for transcription
+3. **Real-time Output**: Appends date/time stamped transcriptions directly to file as they're generated
+4. **Memory Efficient**: Never stores full recording, only current buffer and chunks
+
 Key implementation details:
-- Threading for recording control (start/stop with Enter key)
-- Temporary file handling for audio and editor workflows
-- Flexible output path determination in `determine_output_path()`
+- Threading for recording control and concurrent transcription processing
+- Circular buffer (`collections.deque`) for memory-efficient audio storage
+- Configurable chunk size (`--chunk-size`) and buffer size (`--buffer-size`)
+- Optional memory monitoring with `psutil` (when available)
 - Model selection with `-m` flag (tiny, base, small, medium, turbo, large-v3-turbo with .en variants)
 - Environment variable support for default model (`WHISPER_DEFAULT_MODEL`)
 - Environment variable support for default output folder (`WHISPER_OUTPUT_FOLDER`)

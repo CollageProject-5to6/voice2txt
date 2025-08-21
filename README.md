@@ -6,6 +6,7 @@ This is a cross-platform command-line utility that allows you to record audio fr
 
 -   **Local Transcription:** Uses MLX framework on macOS for fast performance, or OpenAI Whisper for cross-platform support.
 -   **Multiple Model Sizes:** Choose from tiny, base, small, medium, turbo, and large-v3-turbo models to balance speed and accuracy.
+-   **Streaming Mode:** Continuous transcription for long-running sessions without disk space or memory issues.
 -   **Real-time Audio Visualization:** Multiple visual styles during recording including Winamp-style frequency bars, waveforms, spectrum analyzer, and VU meters.
 -   **Manual Recording Control:** Start and stop recording with a keypress.
 -   **Immediate Recording:** Skip the "Press Enter to start" prompt with the `-i/--immediate` flag.
@@ -200,4 +201,34 @@ make run ARGS="-i -e"
 make run ARGS="--viz-style bars"  # Winamp-style frequency bars
 make run ARGS="--viz-style vu"    # Classic VU meter
 make run ARGS="--no-visualize"    # No visualization
+
+# Streaming mode for long sessions (memory-efficient)
+make run ARGS="--stream"                    # Continuous transcription
+make run ARGS="--stream -m tiny.en"        # Fast streaming with tiny model
+make run ARGS="--stream --chunk-size 5"    # Faster processing (5-second chunks)
+make run ARGS="--stream -i long-meeting.txt"  # All-day streaming session
 ```
+
+## Streaming Mode
+
+For long-running transcription sessions (meetings, lectures, all-day monitoring), use streaming mode to avoid memory and disk space issues:
+
+```bash
+# Basic streaming - processes 10-second chunks, maintains 30-second buffer
+make run ARGS="--stream meeting-transcript.txt"
+
+# Fast streaming with smaller model and quicker processing
+make run ARGS="--stream -m tiny.en --chunk-size 5 --buffer-size 15"
+
+# All-day streaming with immediate start
+make run ARGS="--stream -i daily-log.txt"
+
+# Streaming with custom visualization
+make run ARGS="--stream --viz-style bars notes/"
+```
+
+**Streaming Benefits:**
+- **Memory Efficient:** Uses circular buffer, never stores full recording
+- **No Disk Limits:** Only saves transcription text, not audio files
+- **Real-time Output:** See transcription appear as you speak with full date/time stamps
+- **Configurable:** Adjust chunk size (1-30s) and buffer size (10-60s) for your needs
