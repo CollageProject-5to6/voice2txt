@@ -1,0 +1,17 @@
+# Gitignore for voice2txt project
+
+# Python virtual environment
+.venv/
+
+# Temporary audio files
+*.wav
+
+# Generated transcription files
+transcription_*.txt
+
+# macOS specific files
+.DS_Store
+
+# Python bytecode
+*.pyc
+__pycache__/
