@@ -677,24 +677,51 @@ def stream_transcribe(
             while not stop_flag.is_set():
                 # Get next audio chunk
                 chunk_data, timestamp = capture.get_chunk(timeout=1.0)
-                
-                if chunk_data is not None:
+
+                if chunk_data is not None and timestamp is not None:
                     chunk_count += 1
-                    
-                    # Create temporary file for this chunk
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
-                        sf.write(temp_audio.name, chunk_data, capture.samplerate)
-                        temp_audio_path = temp_audio.name
-                    
+
                     try:
-                        # Transcribe chunk
+                        # DIRECT IN-MEMORY TRANSCRIPTION - NO TEMP FILES!
                         if WHISPER_BACKEND == "mlx":
-                            result = whisper_lib(temp_audio_path, path_or_hf_repo=model_name)
+                            # MLX Whisper accepts numpy arrays directly
+                            # whisper_lib is the transcribe function itself for MLX
+                            result = whisper_lib(
+                                chunk_data,  # Pass numpy array directly!
+                                path_or_hf_repo=model_name
+                            )
                             text = result["text"].strip()
                         else:
-                            result = whisper_model.transcribe(temp_audio_path)
-                            text = result["text"].strip()
-                        
+                            # OpenAI Whisper - use direct array processing
+                            if whisper_model is not None:
+                                # Ensure proper format
+                                audio = chunk_data.astype(np.float32)
+
+                                # Normalize if needed
+                                if audio.max() > 1.0:
+                                    audio = audio / np.abs(audio).max()
+
+                                # Pad/trim to expected length
+                                audio = whisper_lib.pad_or_trim(audio)
+
+                                # Generate mel spectrogram
+                                mel = whisper_lib.log_mel_spectrogram(audio)
+
+                                # Detect language and decode
+                                _, probs = whisper_model.detect_language(mel)
+
+                                # Decode
+                                options = whisper_lib.DecodingOptions(
+                                    language=max(probs, key=probs.get),
+                                    fp16=False
+                                )
+                                result = whisper_lib.decode(whisper_model, mel, options)
+                                text = result.text.strip()
+                            else:
+                                # Fallback: This shouldn't happen as whisper_model should be loaded
+                                # But if it does, we can't process raw arrays without the model
+                                raise ValueError("OpenAI Whisper model not loaded properly")
+
                         # Only write if we have new content
                         if text and text != last_text:
                             # Simple deduplication - avoid repeating the same text
@@ -703,7 +730,7 @@ def stream_transcribe(
                                 output_line = f"[{datetime_str}] {text}\n"
                                 output_file.write(output_line)
                                 output_file.flush()
-                                
+
                                 # Show progress (clear visualization and show text)
                                 if visualize:
                                     if viz_style == "bars":
@@ -713,26 +740,20 @@ def stream_transcribe(
                                         sys.stdout.write(f"\033[5A")
                                     else:
                                         sys.stdout.write(f"\033[A\033[K")
-                                    
+
                                 print(f"✅ [{datetime_str}] {text}")
-                                
+
                                 if visualize:
                                     if viz_style == "bars":
                                         for _ in range(5):
                                             print()
                                     else:
                                         print()
-                                
+
                                 last_text = text
-                        
+
                     except Exception as e:
                         print(f"⚠️ Transcription error: {e}")
-                    finally:
-                        # Cleanup temp file
-                        try:
-                            os.remove(temp_audio_path)
-                        except:
-                            pass
                             
         except KeyboardInterrupt:
             stop_flag.set()
@@ -858,6 +879,7 @@ def main():
         try:
             if WHISPER_BACKEND == "mlx":
                 # MLX Whisper API
+                # whisper_lib is the transcribe function itself for MLX
                 result = whisper_lib(audio_file_path, path_or_hf_repo=model_name)
                 transcribed_text = result["text"]
             else:
